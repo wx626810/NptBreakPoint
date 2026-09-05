@@ -61,3 +61,5 @@ VMCB 标志位清理。模块自隐藏（DKOM PsLoadedModuleList + QSI 过滤）
 ## License
 
 本项目基于 GPL-3.0 开源。
+## QQ 
+1843252090  
