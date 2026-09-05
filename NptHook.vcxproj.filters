@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;asm</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx</Extensions>
+    </Filter>
+    <Filter Include="core">
+      <UniqueIdentifier>{A1B2C3D4-0001-4A11-8F01-000000000001}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="services">
+      <UniqueIdentifier>{A1B2C3D4-0002-4A11-8F01-000000000002}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="demo">
+      <UniqueIdentifier>{A1B2C3D4-0003-4A11-8F01-000000000003}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="include">
+      <UniqueIdentifier>{A1B2C3D4-0004-4A11-8F01-000000000004}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <MASM Include="core\x64.asm">
+      <Filter>core</Filter>
+    </MASM>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="NptHook.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="include\NpAsm.h">
+      <Filter>include</Filter>
+    </ClInclude>
+    <ClInclude Include="include\NpConfig.h">
+      <Filter>include</Filter>
+    </ClInclude>
+    <ClInclude Include="include\NpHook.h">
+      <Filter>include</Filter>
+    </ClInclude>
+    <ClInclude Include="include\NpHv.h">
+      <Filter>include</Filter>
+    </ClInclude>
+    <ClInclude Include="include\NpLog.h">
+      <Filter>include</Filter>
+    </ClInclude>
+    <ClInclude Include="include\NpPlatform.h">
+      <Filter>include</Filter>
+    </ClInclude>
+    <ClInclude Include="include\NpSvm.h">
+      <Filter>include</Filter>
+    </ClInclude>
+    <ClInclude Include="include\NpTypes.h">
+      <Filter>include</Filter>
+    </ClInclude>
+    <ClInclude Include="services\NpDisasm.hpp">
+      <Filter>services</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="NptHook.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="core\NpHv.cpp">
+      <Filter>core</Filter>
+    </ClCompile>
+    <ClCompile Include="core\NpHvPower.cpp">
+      <Filter>core</Filter>
+    </ClCompile>
+    <ClCompile Include="core\NpHvVmExit.cpp">
+      <Filter>core</Filter>
+    </ClCompile>
+    <ClCompile Include="core\NpPlatform.cpp">
+      <Filter>core</Filter>
+    </ClCompile>
+    <ClCompile Include="services\NpDisasm.cpp">
+      <Filter>services</Filter>
+    </ClCompile>
+    <ClCompile Include="services\NpHook.cpp">
+      <Filter>services</Filter>
+    </ClCompile>
+    <ClCompile Include="services\NpLog.cpp">
+      <Filter>services</Filter>
+    </ClCompile>
+    <ClCompile Include="demo\DemoHook.cpp">
+      <Filter>demo</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="NptHook.ruleset" />
+  </ItemGroup>
+</Project>
+

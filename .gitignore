@@ -1,0 +1,16 @@
+*.obj
+*.tlog
+*.pdb
+*.ilk
+*.idb
+*.res
+*.sys
+!HwRwDrv.sys
+!NpDrvInst.dll
+*.exe
+*.log
+__pycache__/
+*.pyc
+x64/
+Debug/
+Release/

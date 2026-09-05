@@ -1,0 +1,864 @@
+// ============================ Nt* 解析：导出表 + SSDT 兜底 ============================
+//
+// Windows 11 24H2+ 会把部分 Nt*/Zw* 移出内核导出表，导致
+// MmGetSystemRoutineAddress 失败。SSDT 兜底：从 ntdll 的 syscall stub
+// 提取系统调用号 → 定位 KiServiceTable → 索引出内核函数真实地址
+// （不依赖导出表）。
+//
+
+// 解析模块导出表（PE），返回 ExportName 的函数地址。
+static
+PVOID
+NpGetModuleExport(
+    _In_ PVOID ModuleBase,
+    _In_ PCSTR ExportName
+    )
+{
+    PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(ModuleBase);
+    PIMAGE_NT_HEADERS nt;
+    PIMAGE_EXPORT_DIRECTORY exp;
+    PULONG names;
+    PUSHORT ordinals;
+    PULONG functions;
+
+    if (dos == nullptr || dos->e_magic != IMAGE_DOS_SIGNATURE)
+    {
+        return nullptr;
+    }
+    nt = reinterpret_cast<PIMAGE_NT_HEADERS>(
+        reinterpret_cast<PUCHAR>(ModuleBase) + dos->e_lfanew);
+    if (nt == nullptr || nt->Signature != IMAGE_NT_SIGNATURE)
+    {
+        return nullptr;
+    }
+
+    ULONG expRva = nt->OptionalHeader.DataDirectory[
+        IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    if (expRva == 0)
+    {
+        return nullptr;
+    }
+    exp = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(
+        reinterpret_cast<PUCHAR>(ModuleBase) + expRva);
+    names = reinterpret_cast<PULONG>(
+        reinterpret_cast<PUCHAR>(ModuleBase) + exp->AddressOfNames);
+    ordinals = reinterpret_cast<PUSHORT>(
+        reinterpret_cast<PUCHAR>(ModuleBase) + exp->AddressOfNameOrdinals);
+    functions = reinterpret_cast<PULONG>(
+        reinterpret_cast<PUCHAR>(ModuleBase) + exp->AddressOfFunctions);
+
+    for (ULONG i = 0; i < exp->NumberOfNames; i++)
+    {
+        PCSTR name = reinterpret_cast<PCSTR>(
+            reinterpret_cast<PUCHAR>(ModuleBase) + names[i]);
+        if (strcmp(name, ExportName) == 0)
+        {
+            return reinterpret_cast<PVOID>(
+                reinterpret_cast<PUCHAR>(ModuleBase) + functions[ordinals[i]]);
+        }
+    }
+    return nullptr;
+}
+
+// 从 PsLoadedModuleList 找指定模块基址。
+static
+PVOID
+NpGetModuleBase(
+    _In_ PCWSTR ModuleName
+    )
+{
+    UNICODE_STRING target;
+    PLIST_ENTRY entry;
+
+    RtlInitUnicodeString(&target, ModuleName);
+    if (PsLoadedModuleList == nullptr)
+    {
+        return nullptr;
+    }
+
+    for (entry = PsLoadedModuleList->Flink;
+         entry != PsLoadedModuleList;
+         entry = entry->Flink)
+    {
+        PNP_LDR_DATA_TABLE_ENTRY mod =
+            CONTAINING_RECORD(entry, NP_LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+        if (RtlCompareUnicodeString(&mod->BaseDllName, &target, TRUE) == 0)
+        {
+            return mod->DllBase;
+        }
+    }
+    return nullptr;
+}
+
+// 从当前进程 PEB 加载器列表找模块基址（IOCTL 上下文 = 调用进程，
+// 用户态加载器列表必定包含 ntdll.dll，比 PsLoadedModuleList 更可靠）。
+static
+PVOID
+NpGetModuleBaseFromPeb(
+    _In_ PCWSTR ModuleName
+    )
+{
+    UNICODE_STRING target;
+    PVOID pebBase;
+    PVOID ldr;
+    PLIST_ENTRY head;
+    PLIST_ENTRY entry;
+
+    RtlInitUnicodeString(&target, ModuleName);
+
+    pebBase = PsGetProcessPeb(PsGetCurrentProcess());
+    if (pebBase == nullptr)
+    {
+        return nullptr;
+    }
+
+    __try
+    {
+        ldr = *reinterpret_cast<PVOID*>(
+            reinterpret_cast<PUCHAR>(pebBase) + 0x18);   // PEB.Ldr
+        if (ldr == nullptr)
+        {
+            return nullptr;
+        }
+        head = reinterpret_cast<PLIST_ENTRY>(
+            reinterpret_cast<PUCHAR>(ldr) + 0x10);       // Ldr.InLoadOrderModuleList
+
+        for (entry = head->Flink; entry != head; entry = entry->Flink)
+        {
+            PNP_LDR_DATA_TABLE_ENTRY mod =
+                CONTAINING_RECORD(entry, NP_LDR_DATA_TABLE_ENTRY,
+                                  InLoadOrderLinks);
+            if (RtlCompareUnicodeString(&mod->BaseDllName, &target, TRUE) == 0)
+            {
+                return mod->DllBase;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return nullptr;
+    }
+    return nullptr;
+}
+
+// 从 ntdll 导出函数 stub 提取 syscall 号（stub: 4C 8B D1 ... B8 imm32 ... syscall）。
+static
+ULONG
+NpExtractSyscallNumber(
+    _In_ PCSTR NtName
+    )
+{
+    static PVOID s_NtdllBase = nullptr;
+    PUCHAR stub;
+
+    if (s_NtdllBase == nullptr)
+    {
+        //
+        // 优先当前进程 PEB（必定含 ntdll），再试 PsLoadedModuleList。
+        //
+        s_NtdllBase = NpGetModuleBaseFromPeb(L"ntdll.dll");
+        if (s_NtdllBase == nullptr)
+        {
+            s_NtdllBase = NpGetModuleBase(L"ntdll.dll");
+        }
+    }
+    if (s_NtdllBase == nullptr)
+    {
+        NpHvLogPrint("[dbghide] ssdt: ntdll base resolve failed\n");
+        return 0;
+    }
+
+    stub = static_cast<PUCHAR>(NpGetModuleExport(s_NtdllBase, NtName));
+    if (stub == nullptr)
+    {
+        NpHvLogPrint("[dbghide] ssdt: '%s' not in ntdll export\n", NtName);
+        return 0;
+    }
+
+    //
+    // 在 stub 开头 0x40 字节内找 mov eax, imm32（B8 xx xx xx xx）。
+    //
+    for (ULONG i = 0; i + 5 <= 0x40; i++)
+    {
+        if (stub[i] == 0xB8)
+        {
+            return *reinterpret_cast<PULONG>(stub + i + 1);
+        }
+    }
+    NpHvLogPrint("[dbghide] ssdt: '%s' stub decode failed (no mov eax,imm)\n",
+                 NtName);
+    return 0;
+}
+
+// 导出表解析（MmGetSystemRoutineAddress 首选路径）。
+static
+PVOID
+NpResolveRoutine(
+    _In_ PCSTR Name
+    )
+{
+    ANSI_STRING ansiName;
+    UNICODE_STRING routineName;
+    PVOID resolved;
+
+    RtlInitAnsiString(&ansiName, Name);
+    if (!NT_SUCCESS(RtlAnsiStringToUnicodeString(&routineName, &ansiName, TRUE)))
+    {
+        return nullptr;
+    }
+    resolved = MmGetSystemRoutineAddress(&routineName);
+    RtlFreeUnicodeString(&routineName);
+    return resolved;
+}
+
+// 从 LSTAR(KiSystemCall64) 定位 KiServiceTable，用已知 syscall 校准。
+static
+ULONG_PTR
+NpFindServiceTable(
+    _In_ ULONG KnownSyscall,
+    _In_ ULONG_PTR KnownAddress
+    )
+{
+    ULONG_PTR kiSystemCall;
+    PUCHAR code;
+
+    if (KnownSyscall == 0 || KnownAddress == 0)
+    {
+        return 0;
+    }
+    kiSystemCall = __readmsr(0xC0000082);   // LSTAR = KiSystemCall64
+    if (kiSystemCall == 0 || kiSystemCall < 0xFFFF800000000000ULL)
+    {
+        return 0;
+    }
+    code = reinterpret_cast<PUCHAR>(kiSystemCall);
+
+    //
+    // 反汇编前 0x200 字节，找对 KiServiceTable 的 RIP 相对引用：
+    //   lea r64, [rip+disp32]（REX.W/R 0x48/0x4C 8D /r）
+    //   mov r64, [rip+disp32]（REX.W/R 0x48/0x4C 8B /r）
+    // ModRM mod=00, rm=101 → 目标 = rip_after + disp32。
+    // 用已知 syscall 校准排除其他 RIP 相对引用
+    // （KiServiceTable 在 SSDT 数组中按 syscall*8 索引）。
+    //
+    for (ULONG i = 0; i + 7 <= 0x200; i++)
+    {
+        UCHAR op = code[i];
+        if ((op == 0x48 || op == 0x4C) &&
+            (code[i + 1] == 0x8D || code[i + 1] == 0x8B))
+        {
+            UCHAR modrm = code[i + 2];
+            if ((modrm & 0xC7) == 0x05)          // mod=00, rm=101 → RIP-relative
+            {
+                LONG disp = *reinterpret_cast<PLONG>(code + i + 3);
+                ULONG_PTR table = kiSystemCall + i + 7 + disp;
+
+                if (table + KnownSyscall * 8 == KnownAddress)
+                {
+                    NpHvLogPrint("[dbghide] ssdt: KiServiceTable=0x%p (offset +0x%x)\n",
+                                 reinterpret_cast<PVOID>(table), i);
+                    return table;
+                }
+            }
+        }
+    }
+
+    //
+    // 未直接命中：KiServiceTable 引用可能位于 KiSystemCall64 跳转过去的
+    // KiSystemServiceStart。跟进 jmp/call rel32（E8/E9）再搜一层。
+    //
+    for (ULONG i = 0; i + 5 <= 0x100; i++)
+    {
+        if (code[i] == 0xE8 || code[i] == 0xE9)
+        {
+            LONG disp = *reinterpret_cast<PLONG>(code + i + 1);
+            ULONG_PTR target = kiSystemCall + i + 5 + disp;
+            PUCHAR tcode;
+
+            if (target < 0xFFFF800000000000ULL)
+            {
+                continue;
+            }
+            tcode = reinterpret_cast<PUCHAR>(target);
+            for (ULONG j = 0; j + 7 <= 0x200; j++)
+            {
+                UCHAR op = tcode[j];
+                if ((op == 0x48 || op == 0x4C) &&
+                    (tcode[j + 1] == 0x8D || tcode[j + 1] == 0x8B))
+                {
+                    UCHAR modrm = tcode[j + 2];
+                    if ((modrm & 0xC7) == 0x05)
+                    {
+                        LONG tdisp = *reinterpret_cast<PLONG>(tcode + j + 3);
+                        ULONG_PTR table = target + j + 7 + tdisp;
+
+                        if (table + KnownSyscall * 8 == KnownAddress)
+                        {
+                            NpHvLogPrint("[dbghide] ssdt: KiServiceTable=0x%p "
+                                         "(via +0x%x->0x%p+0x%x)\n",
+                                         reinterpret_cast<PVOID>(table), i,
+                                         reinterpret_cast<PVOID>(target), j);
+                            return table;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    NpHvLogPrint("[dbghide] ssdt: KiServiceTable not found (ki=0x%p, "
+                 "calib={#%lu,0x%p})\n",
+                 reinterpret_cast<PVOID>(kiSystemCall), KnownSyscall,
+                 reinterpret_cast<PVOID>(KnownAddress));
+    return 0;
+}
+
+//============================================================================
+// SSDT 定位（NpProbe 验证版移植，2026-08-19 实测通过）：
+//   1) NpDbgSafeReadBytes：MmIsAddressValid 预检 + SEH（防 0x50 蓝屏，
+//      0x50 类系统内存坏引用无法被 try-except 捕获，必须预检）；
+//   2) NpDbgValidateImage：完整 PE32+ 校验（'MZ'+'PE'+Magic 0x20B+
+//      SizeOfImage+MustContain），防映像内数据误命中；
+//   3) NpDbgFindSsdtByAnchorScan：双锚点 8B/4B + 表特征验证
+//      （连续 64 条目合法 RVA，抗 SSDT hook——实测 QSI 条目被改仍可命中）；
+//   4) NpDbgReadSsdtEntry：4B 条目 = 模块基址 + RVA（实测 QIP 闭环验证）。
+//============================================================================
+static
+BOOLEAN
+NpDbgSafeReadBytes(
+    _In_ ULONG_PTR Src,
+    _Out_writes_bytes_(Length) PVOID Dst,
+    _In_ ULONG Length)
+{
+    if (Src == 0 || Dst == nullptr || Length == 0)
+    {
+        return FALSE;
+    }
+    for (ULONG off = 0; off < Length; off += PAGE_SIZE)
+    {
+        if (!MmIsAddressValid(reinterpret_cast<PVOID>(Src + off)))
+        {
+            return FALSE;
+        }
+    }
+    __try
+    {
+        RtlCopyMemory(Dst, reinterpret_cast<PVOID>(Src), Length);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static
+BOOLEAN
+NpDbgSafeRead64(
+    _In_ ULONG_PTR Src,
+    _Out_ ULONG_PTR* Dst)
+{
+    return NpDbgSafeReadBytes(Src, Dst, sizeof(ULONG_PTR));
+}
+
+// 完整 PE32+ 映像头校验（可选 MustContain 地址必须在映像内）。
+static
+BOOLEAN
+NpDbgValidateImage(
+    _In_ ULONG_PTR Base,
+    _In_ ULONG_PTR MustContain)
+{
+    LONG e_lfanew = 0;
+    ULONG sig = 0;
+    USHORT optMagic = 0;
+    ULONG sizeOfImage = 0;
+
+    if (!NpDbgSafeReadBytes(Base + 0x3C, &e_lfanew, sizeof(e_lfanew)) ||
+        e_lfanew <= 0 || e_lfanew > 0x1000)
+    {
+        return FALSE;
+    }
+    if (!NpDbgSafeReadBytes(Base + e_lfanew, &sig, sizeof(sig)) ||
+        (sig & 0xFFFF) != 0x4550)
+    {
+        return FALSE;
+    }
+    if (!NpDbgSafeReadBytes(Base + e_lfanew + 0x18, &optMagic, sizeof(optMagic)) ||
+        optMagic != 0x20B)
+    {
+        return FALSE;
+    }
+    if (!NpDbgSafeReadBytes(Base + e_lfanew + 0x50, &sizeOfImage, sizeof(sizeOfImage)) ||
+        sizeOfImage < 0x100000 || sizeOfImage > 0x10000000)
+    {
+        return FALSE;
+    }
+    if (MustContain != 0 &&
+        (MustContain < Base || MustContain >= Base + sizeOfImage))
+    {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+// 双锚点 + 表特征扫描定位 KiServiceTable。
+// Qsi 可选：QsiSc/QsiAddr 为 0 时仅用 QIP RVA 命中 + 表特征验证。
+static
+ULONG_PTR
+NpDbgFindSsdtByAnchorScan(
+    _In_ ULONG QipSc,
+    _In_ ULONG_PTR QipAddr,
+    _In_ ULONG QsiSc,
+    _In_ ULONG_PTR QsiAddr,
+    _Out_ ULONG_PTR* OutModuleBase,
+    _Out_ ULONG* OutEntryKind)
+{
+    ULONG_PTR mz = 0;
+    ULONG sizeOfImage = 0;
+    ULONG_PTR end;
+    UCHAR page[PAGE_SIZE];
+    LONG qipRva;
+    BOOLEAN hasQsi = (QsiSc != 0 && QsiAddr != 0);
+
+    if (OutModuleBase != nullptr)
+    {
+        *OutModuleBase = 0;
+    }
+    if (OutEntryKind != nullptr)
+    {
+        *OutEntryKind = 0;
+    }
+    if (QipSc == 0 || QipAddr == 0)
+    {
+        return 0;
+    }
+
+    //
+    // 1. 从 QipAddr 向下 64KB 对齐找有效 PE32+ 映像（ntoskrnl 基址）。
+    //    搜索下限 256MB（ntoskrnl 映像可达 ~10MB，QIP 在其内部偏后）。
+    //
+    for (ULONG_PTR a = QipAddr & ~(ULONG_PTR)0xFFFF;
+         a > 0xFFFF800000000000ull && a > (QipAddr - 0x10000000ull);
+         a -= 0x10000)
+    {
+        USHORT magic = 0;
+        if (!NpDbgSafeReadBytes(a, &magic, sizeof(magic)) || magic != 0x5A4D)
+        {
+            continue;
+        }
+        if (NpDbgValidateImage(a, QipAddr))
+        {
+            mz = a;
+            break;
+        }
+    }
+    if (mz == 0)
+    {
+        return 0;
+    }
+    {
+        LONG e_lfanew = 0;
+        if (!NpDbgSafeReadBytes(mz + 0x3C, &e_lfanew, sizeof(e_lfanew)) ||
+            e_lfanew <= 0 || e_lfanew > 0x1000 ||
+            !NpDbgSafeReadBytes(mz + e_lfanew + 0x50, &sizeOfImage,
+                                sizeof(sizeOfImage)))
+        {
+            return 0;
+        }
+    }
+    end = mz + sizeOfImage;
+    qipRva = (LONG)(QipAddr - mz);
+
+    // ---- 2a. 8B 绝对地址表（Win10 老版本）----
+    if (hasQsi)
+    {
+        ULONG maxOff = PAGE_SIZE;
+        if ((ULONG_PTR)QsiSc * 8 + 8 < maxOff) maxOff = (ULONG)QsiSc * 8 + 8;
+        if ((ULONG_PTR)QipSc * 8 + 8 > maxOff) maxOff = (ULONG)QipSc * 8 + 8;
+        for (ULONG_PTR pg = mz; pg < end; pg += PAGE_SIZE)
+        {
+            if (!NpDbgSafeReadBytes(pg, page, PAGE_SIZE))
+            {
+                continue;
+            }
+            ULONG limit = PAGE_SIZE - maxOff;
+            for (ULONG off = 0; off < limit; off += 8)
+            {
+                ULONG_PTR v =
+                    *reinterpret_cast<PULONG_PTR>(page + off + QipSc * 8);
+                if (v != QipAddr)
+                {
+                    continue;
+                }
+                v = *reinterpret_cast<PULONG_PTR>(page + off + QsiSc * 8);
+                if (v != QsiAddr)
+                {
+                    continue;
+                }
+                if (OutModuleBase != nullptr) *OutModuleBase = mz;
+                if (OutEntryKind != nullptr) *OutEntryKind = 8;
+                return pg + off;
+            }
+        }
+    }
+
+    // ---- 2b. 4B RVA 表（Win10 1903+ / Win11）：模块基址语义 ----
+    {
+        ULONG maxOff = PAGE_SIZE;
+        if ((ULONG_PTR)QsiSc * 4 + 4 < maxOff) maxOff = (ULONG)QsiSc * 4 + 4;
+        if ((ULONG_PTR)QipSc * 4 + 4 > maxOff) maxOff = (ULONG)QipSc * 4 + 4;
+        ULONG_PTR hits[8];
+        ULONG hitCount = 0;
+
+        for (ULONG_PTR pg = mz; pg < end; pg += PAGE_SIZE)
+        {
+            if (!NpDbgSafeReadBytes(pg, page, PAGE_SIZE))
+            {
+                continue;
+            }
+            ULONG limit = PAGE_SIZE - maxOff;
+            for (ULONG off = 0; off < limit; off += 4)
+            {
+                LONG o1 = *reinterpret_cast<PLONG>(page + off + QipSc * 4);
+                if (hasQsi)
+                {
+                    LONG o2 = *reinterpret_cast<PLONG>(page + off + QsiSc * 4);
+                    if ((ULONG_PTR)(mz + (LONG64)o1) == QipAddr &&
+                        (ULONG_PTR)(mz + (LONG64)o2) == QsiAddr)
+                    {
+                        if (OutModuleBase != nullptr) *OutModuleBase = mz;
+                        if (OutEntryKind != nullptr) *OutEntryKind = 4;
+                        return pg + off;
+                    }
+                }
+                // 收集 QIP RVA 命中位置（供表特征验证）
+                if (o1 == qipRva && hitCount < 8)
+                {
+                    hits[hitCount++] = pg + off;
+                }
+            }
+        }
+
+        //
+        // ---- 3. 表特征验证（抗 SSDT hook）----
+        // 不要求条目==已知地址，只要求连续 64 个条目都是合法 RVA
+        // （0x1000 ~ SizeOfImage）。SSDT 的密集 RVA 结构在映像内
+        // 误命中率≈0；即使部分条目被 hook 修改也能识别。
+        // 实测（2026-08-19）：QSI 条目被 hook 的 Win11 上命中成功。
+        //
+        for (ULONG h = 0; h < hitCount; h++)
+        {
+            ULONG_PTR X = hits[h];
+            BOOLEAN looksTable = TRUE;
+            for (ULONG e = 0; e < 64; e++)
+            {
+                LONG ev = 0;
+                if (!NpDbgSafeReadBytes(X + (ULONG_PTR)e * 4, &ev, sizeof(ev)))
+                {
+                    looksTable = FALSE;
+                    break;
+                }
+                ULONG uv = static_cast<ULONG>(ev);
+                if (uv < 0x1000 || uv >= sizeOfImage)
+                {
+                    looksTable = FALSE;
+                    break;
+                }
+            }
+            if (looksTable)
+            {
+                if (OutModuleBase != nullptr) *OutModuleBase = mz;
+                if (OutEntryKind != nullptr) *OutEntryKind = 4;
+                return X;
+            }
+        }
+    }
+
+    return 0;
+}
+
+// 读取 SSDT 条目（4B 模式 = 模块基址 + RVA，实测语义）。
+static
+ULONG_PTR
+NpDbgReadSsdtEntry(
+    _In_ ULONG_PTR TableBase,
+    _In_ ULONG_PTR ModuleBase,
+    _In_ ULONG Syscall,
+    _In_ BOOLEAN EntryIs4ByteOffset)
+{
+    if (TableBase == 0 || TableBase < 0xFFFF800000000000ull)
+    {
+        return 0;
+    }
+    if (EntryIs4ByteOffset)
+    {
+        ULONG off = 0;
+        if (!NpDbgSafeReadBytes(TableBase + (ULONG_PTR)Syscall * 4,
+                                &off, sizeof(off)))
+        {
+            return 0;
+        }
+        LONG soff = static_cast<LONG>(off);
+        if (soff == 0)
+        {
+            return 0;
+        }
+        return (ModuleBase != 0) ? (ModuleBase + soff) : (TableBase + soff);
+    }
+    ULONG_PTR value = 0;
+    if (!NpDbgSafeReadBytes(TableBase + (ULONG_PTR)Syscall * 8,
+                            &value, sizeof(value)))
+    {
+        return 0;
+    }
+    return value;
+}
+
+// SSDT 兜底解析（导出表移除 Nt*/Zw* 时的最后手段）。
+// 移植自 NpProbe 验证版：双锚点 + 表特征扫描 + 模块基址语义。
+static
+PVOID
+NpResolveViaSsdt(
+    _In_ PCSTR NtName
+    )
+{
+    ULONG syscall = NpExtractSyscallNumber(NtName);
+    ULONG_PTR table;
+    ULONG_PTR moduleBase;
+    ULONG entryKind;
+    ULONG_PTR addr;
+
+    if (syscall == 0)
+    {
+        NpHvLogPrint("[dbghide] ssdt '%s': syscall# resolve failed\n", NtName);
+        return nullptr;
+    }
+
+    //
+    // 校准锚点：QIP（必须）+ QSI（可选；QSI 被 hook 不影响，表特征兜底）。
+    //
+    PVOID qip = NpResolveRoutine("NtQueryInformationProcess");
+    ULONG qipSyscall = NpExtractSyscallNumber("NtQueryInformationProcess");
+    PVOID qsi = NpResolveRoutine("NtQuerySystemInformation");
+    ULONG qsiSyscall = NpExtractSyscallNumber("NtQuerySystemInformation");
+    if (qip == nullptr || qipSyscall == 0)
+    {
+        NpHvLogPrint("[dbghide] ssdt '%s': calibrator unavailable\n", NtName);
+        return nullptr;
+    }
+
+    table = NpDbgFindSsdtByAnchorScan(
+        qipSyscall, reinterpret_cast<ULONG_PTR>(qip),
+        qsiSyscall, (qsi != nullptr) ? reinterpret_cast<ULONG_PTR>(qsi) : 0,
+        &moduleBase, &entryKind);
+    if (table == 0)
+    {
+        NpHvLogPrint("[dbghide] ssdt '%s': KiServiceTable not found\n", NtName);
+        return nullptr;
+    }
+    NpHvLogPrint("[dbghide] ssdt: table=0x%p mz=0x%p kind=%lu\n",
+                 reinterpret_cast<PVOID>(table),
+                 reinterpret_cast<PVOID>(moduleBase), entryKind);
+
+    addr = NpDbgReadSsdtEntry(table, moduleBase, syscall, entryKind == 4);
+    if (addr == 0 || addr < 0xFFFF800000000000ULL)
+    {
+        NpHvLogPrint("[dbghide] ssdt '%s': entry invalid (0x%p)\n",
+                     NtName, reinterpret_cast<PVOID>(addr));
+        return nullptr;
+    }
+    NpHvLogPrint("[dbghide] ssdt '%s': syscall#=%lu -> 0x%p\n",
+                 NtName, syscall, reinterpret_cast<PVOID>(addr));
+    return reinterpret_cast<PVOID>(addr);
+}
+
+// 导出表解析（MmGetSystemRoutineAddress 首选路径，已前置定义）。
+
+// Nt* 函数解析（多策略：导出表 → Zw 别名 → SSDT）。
+static
+PVOID
+NpGetNtRoutine(
+    _In_ PCSTR Name
+    )
+{
+    PVOID resolved;
+
+    resolved = NpResolveRoutine(Name);
+    if (resolved != nullptr)
+    {
+        return resolved;
+    }
+
+    //
+    // 尝试 Zw 别名（"NtXxx" → "ZwXxx"，同地址；某些系统只保留其一）。
+    //
+    if (Name[0] == 'N' && Name[1] == 't')
+    {
+        char zwName[64];
+        ULONG len = static_cast<ULONG>(strlen(Name));
+
+        if (len + 1 < sizeof(zwName))
+        {
+            zwName[0] = 'Z';
+            zwName[1] = 'w';
+            RtlCopyMemory(zwName + 2, Name + 2, len - 1);   // 含结尾 NUL
+            resolved = NpResolveRoutine(zwName);
+            if (resolved != nullptr)
+            {
+                NpHvLogPrint("[dbghide] resolve '%s' -> Zw alias '%s'\n",
+                             Name, zwName);
+                return resolved;
+            }
+        }
+    }
+
+    //
+    // 导出表全灭：SSDT 兜底（Win11 24H2+ 移除 Nt*/Zw* 导出的系统）。
+    //
+    resolved = NpResolveViaSsdt(Name);
+    if (resolved != nullptr)
+    {
+        return resolved;
+    }
+
+    NpHvLogPrint("[dbghide] resolve '%s': not exported (Nt/Zw/ssdt)\n", Name);
+    return nullptr;
+}
+
+_Use_decl_annotations_
+NTSTATUS
+NpDebugHideSetEnabled(
+    BOOLEAN Enable)
+{
+    NTSTATUS status;
+    ULONG hooked = 0;
+
+    if (Enable != FALSE)
+    {
+        if (g_HideEnabled)
+        {
+            return STATUS_SUCCESS;          // 已开启
+        }
+
+        //
+        // NtQueryInformationProcess：核心（调试检测伪造），必须成功。
+        //
+        status = NpHookInstallHook(reinterpret_cast<ULONG_PTR>(
+                                       NpGetNtRoutine("NtQueryInformationProcess")),
+                                   NpDbgHideQueryProcessInfo,
+                                   &g_HookNtQIP);
+        if (!NT_SUCCESS(status))
+        {
+            NpHvLogPrint("[dbghide] hook NtQueryInformationProcess failed: 0x%08x "
+                         "(hv=%d)\n",
+                         status, NpHvIsRunning() ? 1 : 0);
+            return status;
+        }
+        hooked++;
+
+        //
+        // 其余 Hook 严格模式：任一失败即整体失败（回滚已装 Hook 并报错）。
+        // 干净系统上 Nt* 均应在导出表（Win11 24H2+ 可能移除 Nt 名，但
+        // NpGetNtRoutine 的 Zw 别名兜底会解析到同一地址）。
+        //
+        #define NP_TRY_HOOK(RoutineName, Callback, Ptr)                        \
+            do {                                                               \
+                status = NpHookInstallHook(reinterpret_cast<ULONG_PTR>(        \
+                                               NpGetNtRoutine(RoutineName)),   \
+                                           Callback, Ptr);                     \
+                if (!NT_SUCCESS(status))                                       \
+                {                                                              \
+                    NpHvLogPrint("[dbghide] hook %s failed: 0x%08x\n",         \
+                                 RoutineName, status);                         \
+                    NpDebugHideSetEnabled(FALSE);                              \
+                    return status;                                             \
+                }                                                              \
+                hooked++;                                                      \
+            } while (0)
+
+        NP_TRY_HOOK("NtWriteVirtualMemory",
+                    NpDbgHideWriteVirtualMemory,
+                    &g_HookNtWVM);
+        NP_TRY_HOOK("NtReadVirtualMemory",
+                    NpDbgHideReadVirtualMemory,
+                    &g_HookNtRVM);
+        NP_TRY_HOOK("NtDebugActiveProcess",
+                    NpDbgHideDebugActiveProcess,
+                    &g_HookNtDAP);
+        NP_TRY_HOOK("NtSetContextThread",
+                    NpDbgHideSetContextThread,
+                    &g_HookNtSCT);
+
+        #undef NP_TRY_HOOK
+
+        g_HideEnabled = TRUE;
+        NpHvLogPrint("[dbghide] debug-hide enabled (%lu/%u hooks)\n",
+                     hooked, 5);
+        return STATUS_SUCCESS;
+    }
+
+    if (g_HookNtQIP != nullptr)
+    {
+        NpHookUninstallHook(g_HookNtQIP, FALSE);
+        g_HookNtQIP = nullptr;
+    }
+    if (g_HookNtWVM != nullptr)
+    {
+        NpHookUninstallHook(g_HookNtWVM, FALSE);
+        g_HookNtWVM = nullptr;
+    }
+    if (g_HookNtRVM != nullptr)
+    {
+        NpHookUninstallHook(g_HookNtRVM, FALSE);
+        g_HookNtRVM = nullptr;
+    }
+    if (g_HookNtDAP != nullptr)
+    {
+        NpHookUninstallHook(g_HookNtDAP, FALSE);
+        g_HookNtDAP = nullptr;
+    }
+    if (g_HookNtSCT != nullptr)
+    {
+        NpHookUninstallHook(g_HookNtSCT, FALSE);
+        g_HookNtSCT = nullptr;
+    }
+    g_HideEnabled = FALSE;
+    NpHvLogPrint("[dbghide] debug-hide disabled\n");
+    return STATUS_SUCCESS;
+}
+
+//
+// ============================ 生命周期 ============================
+//
+
+_Use_decl_annotations_
+NTSTATUS
+NpDebugHideInitialize(
+    VOID)
+{
+    RtlZeroMemory(g_ProtectedPids, sizeof(g_ProtectedPids));
+    RtlZeroMemory(g_ProtectedPebBase, sizeof(g_ProtectedPebBase));
+    RtlZeroMemory(g_ProtectedDebuggerPid, sizeof(g_ProtectedDebuggerPid));
+    KeInitializeSpinLock(&g_PidLock);
+    g_HideEnabled = FALSE;
+    g_HookNtQIP = nullptr;
+    g_HookNtWVM = nullptr;
+    g_HookNtRVM = nullptr;
+    g_HookNtDAP = nullptr;
+    g_HookNtSCT = nullptr;
+    return STATUS_SUCCESS;
+}
+
+_Use_decl_annotations_
+VOID
+NpDebugHideTeardown(
+    VOID)
+{
+    //
+    // 卸载 Hook（虚拟化在位时摘除更安全，但服务 Teardown 在去虚拟化后
+    // 执行——此时 Hook 无执行者，立即释放安全）。
+    //
+    NpDebugHideSetEnabled(FALSE);
+    RtlZeroMemory(g_ProtectedPids, sizeof(g_ProtectedPids));
+    RtlZeroMemory(g_ProtectedPebBase, sizeof(g_ProtectedPebBase));
+    RtlZeroMemory(g_ProtectedDebuggerPid, sizeof(g_ProtectedD

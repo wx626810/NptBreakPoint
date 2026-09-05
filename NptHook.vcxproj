@@ -1,0 +1,131 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{6E2A0F4B-3D7C-4E1B-9A2F-0B5C8D1E7F3A}</ProjectGuid>
+    <RootNamespace>NptHook</RootNamespace>
+    <ProjectName>NptHook</ProjectName>
+    <!-- 框架驱动产物名：NpHv.sys（与代码 Np*/NpHv* 前缀统一） -->
+    <TargetName>NpHv</TargetName>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <!--
+      自包含配置：当 Windows SDK 的 MSBuild 集成组件未完整安装时，
+      WindowsSdk.props 缺失会导致 WDK 包含/库路径不注入（C1083: ntddk.h）。
+      这里显式指定 Windows Kits 路径，任何安装了 WDK 的机器都可直接编译。
+      如使用其他 SDK 版本，请同步修改 SdkVersion。
+    -->
+    <KitsRoot>$(ProgramFiles(x86))\Windows Kits\10</KitsRoot>
+    <SdkVersion>10.0.26100.0</SdkVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup>
+    <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
+    <CodeAnalysisRuleSet>NptHook.ruleset</CodeAnalysisRuleSet>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <DisableSpecificWarnings>5040;4201;4702;4005;4083;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <PreprocessorDefinitions>POOL_NX_OPTIN=1;NPTHOOK_KERNEL_BUILD=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- 源码为 UTF-8（无 BOM），显式指定编译器按 UTF-8 读取，避免按系统代码页(936)误读中文注释 -->
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <!-- WDK 头文件路径（SDK 集成缺失时的兜底）-->
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)include;$(ProjectDir)services;$(KitsRoot)\Include\$(SdkVersion)\km;$(KitsRoot)\Include\$(SdkVersion)\shared;$(KitsRoot)\Include\$(SdkVersion)\ucrt;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>ntoskrnl.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(KitsRoot)\Lib\$(SdkVersion)\km\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <EntryPoint>DriverEntry</EntryPoint>
+      <SubSystem>Native</SubSystem>
+    </Link>
+    <DriverSign>
+      <FileDigestAlgorithm>SHA256</FileDigestAlgorithm>
+    </DriverSign>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <FilesToPackage Include="$(TargetPath)" />
+  </ItemGroup>
+  <ItemGroup>
+    <MASM Include="core\x64.asm" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="NptHook.hpp" />
+    <ClInclude Include="include\NpAsm.h" />
+    <ClInclude Include="include\NpBreakPoint.h" />
+    <ClInclude Include="include\NpConfig.h" />
+    <ClInclude Include="include\NpDebugHide.h" />
+    <ClInclude Include="include\NpProcessHide.h" />
+    <ClInclude Include="include\NpHook.h" />
+    <ClInclude Include="include\NpHv.h" />
+    <ClInclude Include="include\NpHvArch.h" />
+    <ClInclude Include="include\NpIoctl.h" />
+    <ClInclude Include="include\NpLog.h" />
+    <ClInclude Include="include\NpDataPatch.h" />
+    <ClInclude Include="include\NpLstar.h" />
+    <ClInclude Include="include\NpPseudoDbg.h" />
+    <ClInclude Include="include\NpSyscall.h" />
+    <ClInclude Include="include\NpVHook.h" />
+    <ClInclude Include="include\NpMemAccess.h" />
+    <ClInclude Include="include\NpPlatform.h" />
+    <ClInclude Include="include\NpSvm.h" />
+    <ClInclude Include="include\NpTypes.h" />
+    <ClInclude Include="services\NpDisasm.hpp" />
+    <ClInclude Include="services\NpReloc.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="NptHook.cpp" />
+    <ClCompile Include="core\NpHv.cpp" />
+    <ClCompile Include="core\NpHvArchSvm.cpp" />
+    <ClCompile Include="core\NpHvPower.cpp" />
+    <ClCompile Include="core\NpHvVmExit.cpp" />
+    <ClCompile Include="core\NpPlatform.cpp" />
+    <ClCompile Include="core\NpSelfHide.cpp" />
+    <ClCompile Include="services\NpDisasm.cpp" />
+    <ClCompile Include="services\NpReloc.cpp" />
+    <ClCompile Include="services\NpSyscall.cpp" />
+    <ClCompile Include="services\NpLstar.cpp" />
+    <ClCompile Include="services\NpPseudoDbg.cpp" />
+    <ClCompile Include="services\NpVHook.cpp" />
+    <ClCompile Include="services\NpDataPatch.cpp" />
+    <ClCompile Include="services\NpBreakPoint.cpp" />
+    <ClCompile Include="services\NpDebugHide.cpp" />
+    <ClCompile Include="services\NpProcessHide.cpp" />
+    <ClCompile Include="services\NpDevIoctl.cpp" />
+    <ClCompile Include="services\NpHook.cpp" />
+    <ClCompile Include="services\NpLog.cpp" />
+    <ClCompile Include="services\NpMemAccess.cpp" />
+    <ClCompile Include="demo\DemoHook.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="NptHook.ruleset" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
+
+
+
